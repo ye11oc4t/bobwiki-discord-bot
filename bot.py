@@ -2,6 +2,7 @@ import os
 import json
 import time
 import logging
+import difflib
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 from urllib.parse import quote
@@ -21,6 +22,10 @@ except Exception:
 
 DISCORD_WEBHOOK_URL = os.getenv("DISCORD_WEBHOOK_URL")
 
+# 비워두면 Discord 웹훅에 직접 설정한 아이콘을 사용합니다.
+# 특정 이미지로 강제하려면 Railway Variables에 DISCORD_AVATAR_URL을 넣으세요.
+DISCORD_AVATAR_URL = os.getenv("DISCORD_AVATAR_URL")
+
 WIKI_API_URL = os.getenv("WIKI_API_URL", "https://kitribob.wiki/api.php")
 WIKI_BASE_URL = os.getenv("WIKI_BASE_URL", "https://kitribob.wiki/wiki/")
 
@@ -37,12 +42,17 @@ RC_NAMESPACE = os.getenv("RC_NAMESPACE", "0")
 RC_TYPE = os.getenv("RC_TYPE", "edit|new")
 
 # Railway Volume을 붙이면 /data/state.json 추천
-# Volume 없이도 동작하게 기본값은 로컬 파일로 둠
 STATE_FILE = Path(os.getenv("STATE_FILE", "state.json"))
 
 # 첫 실행 때 기존 최근바뀜을 Discord로 보낼지 여부
 # false면 첫 실행 시 현재 최신 rcid까지만 저장하고 알림은 보내지 않음
 SEND_EXISTING_ON_FIRST_RUN = os.getenv("SEND_EXISTING_ON_FIRST_RUN", "false").lower() == "true"
+
+# 실제 문서 변경 내용을 디코에 표시할지 여부
+SHOW_ACTUAL_DIFF = os.getenv("SHOW_ACTUAL_DIFF", "true").lower() == "true"
+
+# Discord embed field value는 1024자 제한이 있으므로 안전하게 900자 내외로 자릅니다.
+MAX_DIFF_CHARS = int(os.getenv("MAX_DIFF_CHARS", "900"))
 
 USER_AGENT = os.getenv(
     "USER_AGENT",
@@ -106,8 +116,29 @@ def save_state(state: Dict[str, Any]) -> None:
 
 
 # =========================
-# Wiki
+# Wiki API
 # =========================
+
+def wiki_get(params: Dict[str, str]) -> Dict[str, Any]:
+    headers = {
+        "User-Agent": USER_AGENT,
+    }
+
+    response = requests.get(
+        WIKI_API_URL,
+        params=params,
+        headers=headers,
+        timeout=20,
+    )
+    response.raise_for_status()
+
+    data = response.json()
+
+    if "error" in data:
+        raise RuntimeError(f"MediaWiki API error: {data['error']}")
+
+    return data
+
 
 def fetch_recent_changes() -> List[Dict[str, Any]]:
     params = {
@@ -122,29 +153,96 @@ def fetch_recent_changes() -> List[Dict[str, Any]]:
     if RC_NAMESPACE != "":
         params["rcnamespace"] = RC_NAMESPACE
 
-    headers = {
-        "User-Agent": USER_AGENT,
-    }
-
-    response = requests.get(
-        WIKI_API_URL,
-        params=params,
-        headers=headers,
-        timeout=15,
-    )
-    response.raise_for_status()
-
-    data = response.json()
-
-    if "error" in data:
-        raise RuntimeError(f"MediaWiki API error: {data['error']}")
-
+    data = wiki_get(params)
     return data.get("query", {}).get("recentchanges", [])
 
+
+def fetch_revision_text(revid: Optional[int]) -> Optional[str]:
+    if not revid:
+        return None
+
+    # MediaWiki 최신 방식: slots/main/content
+    params = {
+        "action": "query",
+        "prop": "revisions",
+        "revids": str(revid),
+        "rvprop": "ids|content",
+        "rvslots": "main",
+        "format": "json",
+        "formatversion": "2",
+    }
+
+    try:
+        data = wiki_get(params)
+        pages = data.get("query", {}).get("pages", [])
+
+        if not pages:
+            return None
+
+        revisions = pages[0].get("revisions", [])
+        if not revisions:
+            return None
+
+        rev = revisions[0]
+
+        slots = rev.get("slots", {})
+        main_slot = slots.get("main", {})
+
+        if "content" in main_slot:
+            return main_slot.get("content")
+
+        if "content" in rev:
+            return rev.get("content")
+
+    except Exception as e:
+        logger.warning(
+            "Failed to fetch revision text with slots. revid=%s error=%s",
+            revid,
+            e,
+        )
+
+    # 구버전 fallback
+    fallback_params = {
+        "action": "query",
+        "prop": "revisions",
+        "revids": str(revid),
+        "rvprop": "ids|content",
+        "format": "json",
+    }
+
+    try:
+        data = wiki_get(fallback_params)
+        pages = data.get("query", {}).get("pages", {})
+
+        for page in pages.values():
+            revisions = page.get("revisions", [])
+            if revisions:
+                return revisions[0].get("*")
+
+    except Exception as e:
+        logger.warning(
+            "Failed to fetch revision text fallback. revid=%s error=%s",
+            revid,
+            e,
+        )
+
+    return None
+
+
+# =========================
+# Formatting
+# =========================
 
 def build_page_url(title: str) -> str:
     normalized_title = title.replace(" ", "_")
     return WIKI_BASE_URL.rstrip("/") + "/" + quote(normalized_title)
+
+
+def build_diff_url(old_revid: Optional[int], revid: Optional[int], page_url: str) -> str:
+    if old_revid and revid:
+        return f"{WIKI_BASE_URL.rstrip('/')}/Special:Diff/{old_revid}/{revid}"
+
+    return page_url
 
 
 def format_size_diff(oldlen: Optional[int], newlen: Optional[int]) -> str:
@@ -171,6 +269,87 @@ def get_change_type_label(rc: Dict[str, Any]) -> str:
     return change_type or "변경"
 
 
+def truncate_text(text: str, max_chars: int) -> str:
+    if len(text) <= max_chars:
+        return text
+
+    return text[:max_chars - 20].rstrip() + "\n...생략됨"
+
+
+def build_actual_diff_text(old_text: Optional[str], new_text: Optional[str]) -> str:
+    if new_text is None:
+        return "문서 내용을 가져오지 못했습니다."
+
+    # 새 문서인 경우: 새 본문 일부를 + 줄로 표시
+    if old_text is None:
+        new_lines = new_text.splitlines()
+
+        if not new_lines:
+            return "새 문서가 생성됐지만 본문 내용이 비어 있습니다."
+
+        preview_lines = []
+
+        for line in new_lines:
+            if line.strip():
+                preview_lines.append("+ " + line)
+
+            if len("\n".join(preview_lines)) >= MAX_DIFF_CHARS:
+                break
+
+        if not preview_lines:
+            return "새 문서가 생성됐지만 본문 내용이 비어 있습니다."
+
+        return truncate_text("\n".join(preview_lines), MAX_DIFF_CHARS)
+
+    old_lines = old_text.splitlines()
+    new_lines = new_text.splitlines()
+
+    diff_lines = list(
+        difflib.unified_diff(
+            old_lines,
+            new_lines,
+            fromfile="이전",
+            tofile="현재",
+            lineterm="",
+            n=2,
+        )
+    )
+
+    cleaned_lines = []
+
+    for line in diff_lines:
+        # unified diff 파일 헤더 제거
+        if line.startswith("--- ") or line.startswith("+++ "):
+            continue
+
+        # 너무 긴 한 줄은 자르기
+        if len(line) > 220:
+            line = line[:217] + "..."
+
+        cleaned_lines.append(line)
+
+        if len("\n".join(cleaned_lines)) >= MAX_DIFF_CHARS:
+            break
+
+    if not cleaned_lines:
+        return "본문 기준 변경된 줄을 찾지 못했습니다."
+
+    return truncate_text("\n".join(cleaned_lines), MAX_DIFF_CHARS)
+
+
+def get_actual_change_text(rc: Dict[str, Any]) -> str:
+    if not SHOW_ACTUAL_DIFF:
+        return "실제 변경 내용 표시가 비활성화되어 있습니다."
+
+    revid = rc.get("revid")
+    old_revid = rc.get("old_revid")
+
+    new_text = fetch_revision_text(revid)
+    old_text = fetch_revision_text(old_revid) if old_revid else None
+
+    return build_actual_diff_text(old_text, new_text)
+
+
 # =========================
 # Discord
 # =========================
@@ -178,9 +357,11 @@ def get_change_type_label(rc: Dict[str, Any]) -> str:
 def send_discord_notification(rc: Dict[str, Any]) -> None:
     title = rc.get("title", "(제목 없음)")
     user = rc.get("user", "알 수 없음")
-    comment = rc.get("comment") or "편집 요약 없음"
+    comment = rc.get("comment") or "없음"
     timestamp = rc.get("timestamp", "확인 불가")
     rcid = rc.get("rcid")
+    revid = rc.get("revid")
+    old_revid = rc.get("old_revid")
     oldlen = rc.get("oldlen")
     newlen = rc.get("newlen")
 
@@ -188,6 +369,7 @@ def send_discord_notification(rc: Dict[str, Any]) -> None:
     change_label = get_change_type_label(rc)
 
     page_url = build_page_url(title)
+    diff_url = build_diff_url(old_revid, revid, page_url)
     size_diff = format_size_diff(oldlen, newlen)
 
     if change_type == "new":
@@ -200,10 +382,12 @@ def send_discord_notification(rc: Dict[str, Any]) -> None:
         color = 0xFEE75C
         emoji = "📌"
 
+    actual_diff_text = get_actual_change_text(rc)
+
     embed = {
         "title": f"{emoji} {change_label}: {title}",
         "url": page_url,
-        "description": comment[:3500],
+        "description": f"**편집 코멘트**\n{comment[:1000]}",
         "color": color,
         "fields": [
             {
@@ -217,23 +401,33 @@ def send_discord_notification(rc: Dict[str, Any]) -> None:
                 "inline": True,
             },
             {
-                "name": "rcid",
-                "value": str(rcid),
-                "inline": True,
-            },
-            {
                 "name": "시간",
                 "value": str(timestamp),
                 "inline": False,
             },
+            {
+                "name": "실제 변경 내용",
+                "value": f"```diff\n{actual_diff_text}\n```",
+                "inline": False,
+            },
+            {
+                "name": "링크",
+                "value": f"[문서 보기]({page_url}) / [변경 비교 보기]({diff_url})",
+                "inline": False,
+            },
         ],
+        "footer": {
+            "text": f"rcid: {rcid} / revid: {revid}",
+        },
     }
 
     payload = {
         "username": "지금 밥위키는...",
-        "avatar_url": "https://raw.githubusercontent.com/ye11oc4t/bobwiki-discord-bot/main/20260705_234825.png",
         "embeds": [embed],
     }
+
+    if DISCORD_AVATAR_URL:
+        payload["avatar_url"] = DISCORD_AVATAR_URL
 
     response = requests.post(
         DISCORD_WEBHOOK_URL,
@@ -319,6 +513,7 @@ def main() -> None:
     logger.info("RC_NAMESPACE=%s", RC_NAMESPACE)
     logger.info("RC_TYPE=%s", RC_TYPE)
     logger.info("STATE_FILE=%s", STATE_FILE)
+    logger.info("SHOW_ACTUAL_DIFF=%s", SHOW_ACTUAL_DIFF)
 
     while True:
         try:
