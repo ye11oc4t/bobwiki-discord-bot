@@ -231,7 +231,7 @@ def send_discord_notification(rc: Dict[str, Any]) -> None:
 
     payload = {
         "username": "지금 밥위키는...",
-        "avatar_url": "https://www.mediawiki.org/static/images/project-logos/mediawikiwiki.png",
+        "avatar_url": "https://raw.githubusercontent.com/ye11oc4t/bobwiki-discord-bot/main/20260705_234825.png",
         "embeds": [embed],
     }
 
