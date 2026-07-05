@@ -1,4 +1,4 @@
-# BoB Wiki Discord Watcher
+# BoB Wiki Discord Bot
 
 BoB Wiki의 최근 바뀜을 주기적으로 확인해서 새 문서나 문서 수정이 생기면 Discord Webhook으로 알림을 보내는 봇입니다.
 
